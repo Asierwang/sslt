@@ -1,0 +1,16 @@
+# 加密密钥
+encryption.key
+
+# 日志目录
+log/
+
+# 本地配置
+connections.ini
+
+# Python编译文件
+__pycache__/
+*.pyc
+
+# 开发环境相关
+.venv/
+venv/

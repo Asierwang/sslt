@@ -8,8 +8,9 @@ from Crypto.Random import get_random_bytes
 import select
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QLabel, QLineEdit, QPushButton, QTabWidget, QFormLayout, 
-                             QListWidget, QMessageBox, QStatusBar)
+                             QListWidget, QMessageBox, QStatusBar, QTextEdit)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QMutex
+import queue
 import socket
 import threading
 import logging
@@ -22,7 +23,7 @@ from cryptography.utils import CryptographyDeprecationWarning
 warnings.filterwarnings('ignore', category=CryptographyDeprecationWarning, module='paramiko')
 
 import paramiko
-from paramiko import SSHClient, AutoAddPolicy
+from paramiko import SSHClient, AutoAddPolicy, SSHException, ChannelException
 
 # 确保日志目录存在
 log_dir = 'log'
@@ -34,7 +35,7 @@ log_filename = os.path.join(log_dir, datetime.datetime.now().strftime('%Y-%m-%d.
 logger = logging.getLogger('ssh_client')
 logger.setLevel(logging.INFO)
 
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s - %(exc_info)s')
 
 file_handler = logging.FileHandler(log_filename)
 file_handler.setFormatter(formatter)
@@ -209,6 +210,23 @@ class SSHConnectionThread(QThread):
     disconnected = pyqtSignal()
     error = pyqtSignal(str)
     tunnel_established = pyqtSignal(int, str, int)  # local_port, remote_host, remote_port
+    terminal_output = pyqtSignal(str)
+
+    def __init__(self, host, port, username, password, tunnels):
+        super().__init__()
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.tunnels = tunnels
+        self.ssh_client = None
+        self.transport = None
+        self.tunnel_manager = TunnelManager()
+        self.running = True
+        self.active = False
+        self.command_queue = queue.Queue()
+        self.command_queue = queue.Queue()
+        self.shell = None
     
     def __init__(self, host, port, username, password, tunnels):
         super().__init__()
@@ -222,6 +240,8 @@ class SSHConnectionThread(QThread):
         self.tunnel_manager = TunnelManager()
         self.running = True
         self.active = False
+        self.command_queue = queue.Queue()  # 初始化命令队列
+        self.shell = None
 
     def run(self):
         logger.info(f'正在连接 {self.host}:{self.port} 用户 {self.username}')
@@ -241,6 +261,11 @@ class SSHConnectionThread(QThread):
             self.active = True
             self.connected.emit()
             logger.info('连接成功')
+
+            # 初始化终端shell
+            self.shell = self.ssh_client.invoke_shell()
+            self.shell.setblocking(0)
+            logger.info('终端shell已初始化')
             
             # 建立隧道
             for local_port, remote_host, remote_port in self.tunnels:
@@ -255,8 +280,36 @@ class SSHConnectionThread(QThread):
             
             # 保持连接
             while self.running and self.transport.is_active():
-                self.msleep(1000)
-                
+                # 处理命令队列
+                while not self.command_queue.empty():
+                    cmd = self.command_queue.get()
+                    try:
+                        self.shell.send(cmd + '\n')
+                        logger.info(f'发送命令: {cmd}')
+                    except Exception as e:
+                        logger.error(f'发送命令失败: {str(e)}')
+                        self.terminal_output.emit(f'发送命令失败: {str(e)}\n')
+
+                # 读取终端输出
+                try:
+                    if self.ssh_client and self.shell is not None and not self.shell.closed and self.ssh_client.get_transport().is_active():
+                        output = self.shell.recv(4096).decode('utf-8', errors='replace')
+                        if output:
+                            self.terminal_output.emit(output)
+                except (BlockingIOError, socket.timeout) as e:
+                    # 非阻塞模式下无数据时的正常异常
+                    pass
+                except (ConnectionResetError, SSHException, ChannelException, EOFError, OSError) as e:
+                    if self.running:
+                        logger.exception('终端连接异常')
+                except Exception as e:
+                    if self.running:
+                        logger.exception('读取终端输出错误')
+
+                self.msleep(100)
+
+            # End of while loop
+
         except Exception as e:
             error_msg = f'连接错误: {str(e)}'
             logger.error(error_msg)
@@ -265,7 +318,7 @@ class SSHConnectionThread(QThread):
             self.active = False
             # 先关闭隧道
             self.tunnel_manager.close_all()
-            # 再关闭SSH连接
+            # 关闭SSH连接
             if self.ssh_client:
                 try:
                     self.ssh_client.close()
@@ -277,12 +330,23 @@ class SSHConnectionThread(QThread):
     def stop(self):
         self.running = False
         self.tunnel_manager.close_all()
+        if self.shell and not self.shell.closed:
+            try:
+                self.shell.close()
+            except:
+                pass
         if self.ssh_client:
             try:
                 self.ssh_client.close()
             except:
                 pass
         self.wait(3000)  # 等待线程结束
+
+    def send_command(self, command):
+        if self.active and self.shell and not self.shell.closed:
+            self.command_queue.put(command)
+        else:
+            logger.warning('无法发送命令: SSH连接未激活')
 
 class SSHClientApp(QMainWindow):
     def __init__(self):
@@ -346,6 +410,11 @@ class SSHClientApp(QMainWindow):
         self.tabs.addTab(self.tunnel_tab, '端口隧道')
         self.init_tunnel_tab()
 
+        # 终端标签页
+        self.terminal_tab = QWidget()
+        self.tabs.addTab(self.terminal_tab, '终端界面')
+        self.init_terminal_tab()
+
         # 状态栏
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
@@ -393,6 +462,21 @@ class SSHClientApp(QMainWindow):
         layout.addLayout(btn_layout)
         layout.addWidget(QLabel('已保存连接:'))
         layout.addWidget(self.connections_list)
+
+    def init_terminal_tab(self):
+        layout = QVBoxLayout(self.terminal_tab)
+
+        # 终端显示区域
+        self.terminal_output = QTextEdit()
+        self.terminal_output.setReadOnly(True)
+        self.terminal_output.setStyleSheet("background-color: black; color: white;")
+
+        # 命令输入区域
+        self.command_input = QLineEdit()
+        self.command_input.returnPressed.connect(self.send_terminal_command)
+
+        layout.addWidget(self.terminal_output)
+        layout.addWidget(self.command_input)
 
     def init_tunnel_tab(self):
         layout = QVBoxLayout(self.tunnel_tab)
@@ -539,6 +623,7 @@ class SSHClientApp(QMainWindow):
         self.ssh_thread.disconnected.connect(self.on_disconnected)
         self.ssh_thread.error.connect(self.on_error)
         self.ssh_thread.tunnel_established.connect(self.on_tunnel_established)
+        self.ssh_thread.terminal_output.connect(self.update_terminal_output)
         self.ssh_thread.start()
         self.connect_btn.setText('断开连接')
         self.set_ui_enabled(False)
@@ -572,6 +657,16 @@ class SSHClientApp(QMainWindow):
         self.status_bar.showMessage(f'隧道: 本地 {local_port} -> {remote_host}:{remote_port}')
         QMessageBox.information(self, '隧道建立', 
                                f'隧道建立成功!\n本地端口: {local_port}\n远程目标: {remote_host}:{remote_port}')
+
+    def send_terminal_command(self):
+        command = self.command_input.text().strip()
+        if command and self.ssh_thread and self.ssh_thread.active:
+            self.terminal_output.append(f'$ {command}')
+            self.ssh_thread.send_command(command)
+            self.command_input.clear()
+
+    def update_terminal_output(self, output):
+        self.terminal_output.append(output)
 
     def set_ui_enabled(self, enabled):
         self.host_input.setEnabled(enabled)

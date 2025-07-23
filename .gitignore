@@ -14,3 +14,5 @@ __pycache__/
 # 开发环境相关
 .venv/
 venv/
+
+app.py
